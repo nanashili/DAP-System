@@ -60,6 +60,38 @@ public struct DAPThread: Sendable, Equatable {
     }
 }
 
+public enum DAPSteppingGranularity: String, Sendable, CaseIterable {
+    case statement
+    case line
+    case instruction
+}
+
+public struct DAPSteppingOptions: Sendable, Equatable {
+    public var singleThread: Bool?
+    public var granularity: DAPSteppingGranularity?
+
+    public init(
+        singleThread: Bool? = nil,
+        granularity: DAPSteppingGranularity? = nil
+    ) {
+        self.singleThread = singleThread
+        self.granularity = granularity
+    }
+}
+
+extension DAPSteppingOptions {
+    func asDAPArguments() -> [String: DAPJSONValue] {
+        var arguments: [String: DAPJSONValue] = [:]
+        if let singleThread {
+            arguments["singleThread"] = .bool(singleThread)
+        }
+        if let granularity {
+            arguments["granularity"] = .string(granularity.rawValue)
+        }
+        return arguments
+    }
+}
+
 public struct DAPStackFrame: Sendable, Equatable {
     public let id: Int
     public let name: String
@@ -182,6 +214,56 @@ public struct DAPScope: Sendable, Equatable {
             source: source,
             line: object["line"]?.intValue,
             column: object["column"]?.intValue
+        )
+    }
+}
+
+public struct DAPStepInTarget: Sendable, Equatable {
+    public let id: Int
+    public let label: String
+    public let line: Int?
+    public let column: Int?
+    public let endLine: Int?
+    public let endColumn: Int?
+    public let instructionPointerReference: String?
+
+    public init(
+        id: Int,
+        label: String,
+        line: Int? = nil,
+        column: Int? = nil,
+        endLine: Int? = nil,
+        endColumn: Int? = nil,
+        instructionPointerReference: String? = nil
+    ) {
+        self.id = id
+        self.label = label
+        self.line = line
+        self.column = column
+        self.endLine = endLine
+        self.endColumn = endColumn
+        self.instructionPointerReference = instructionPointerReference
+    }
+
+    init(json: DAPJSONValue) throws {
+        guard case .object(let object) = json,
+            let id = object["id"]?.intValue,
+            let label = object["label"]?.stringValue
+        else {
+            throw DAPError.invalidResponse(
+                "StepInTarget payload missing required fields"
+            )
+        }
+
+        self.init(
+            id: id,
+            label: label,
+            line: object["line"]?.intValue,
+            column: object["column"]?.intValue,
+            endLine: object["endLine"]?.intValue,
+            endColumn: object["endColumn"]?.intValue,
+            instructionPointerReference:
+                object["instructionPointerReference"]?.stringValue
         )
     }
 }

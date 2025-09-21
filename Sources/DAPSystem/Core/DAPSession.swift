@@ -33,7 +33,7 @@ public final class DAPSession: Sendable {
         category: "DAPSession"
     )
 
-    private(set) var capabilities: Set<String> = []
+    private var capabilityFlags: [String: Bool] = [:]
     private var watchExpressions: [DAPWatchExpression] = []
     private var conditionalBreakpoints: [DAPConditionalBreakpoint] = []
     private var lastSynchronizedBreakpointFiles: Set<URL> = []
@@ -147,7 +147,7 @@ public final class DAPSession: Sendable {
             let capabilitiesValue = body["capabilities"],
             case .object(let capabilitiesObject) = capabilitiesValue
         {
-            capabilities = Set(capabilitiesObject.keys)
+            updateAdapterCapabilities(capabilitiesObject)
         }
 
         try await withCheckedThrowingContinuation { continuation in
@@ -218,16 +218,84 @@ public final class DAPSession: Sendable {
         _ = try await sendRunControlCommand("pause", threadID: threadID)
     }
 
-    public func stepIn(threadID: Int) async throws {
-        _ = try await sendRunControlCommand("stepIn", threadID: threadID)
+    public func stepIn(
+        threadID: Int,
+        targetID: Int? = nil,
+        options: DAPSteppingOptions = DAPSteppingOptions()
+    ) async throws {
+        var arguments = options.asDAPArguments()
+        if let targetID {
+            try requireCapability(
+                "supportsStepInTargetsRequest",
+                feature: "stepIn with targetId"
+            )
+            arguments["targetId"] = .number(Double(targetID))
+        }
+        _ = try await sendRunControlCommand(
+            "stepIn",
+            threadID: threadID,
+            additionalArguments: arguments
+        )
     }
 
-    public func stepOut(threadID: Int) async throws {
-        _ = try await sendRunControlCommand("stepOut", threadID: threadID)
+    public func stepOut(
+        threadID: Int,
+        options: DAPSteppingOptions = DAPSteppingOptions()
+    ) async throws {
+        _ = try await sendRunControlCommand(
+            "stepOut",
+            threadID: threadID,
+            additionalArguments: options.asDAPArguments()
+        )
     }
 
-    public func stepOver(threadID: Int) async throws {
-        _ = try await sendRunControlCommand("next", threadID: threadID)
+    public func stepOver(
+        threadID: Int,
+        options: DAPSteppingOptions = DAPSteppingOptions()
+    ) async throws {
+        _ = try await sendRunControlCommand(
+            "next",
+            threadID: threadID,
+            additionalArguments: options.asDAPArguments()
+        )
+    }
+
+    public func stepBack(
+        threadID: Int,
+        options: DAPSteppingOptions = DAPSteppingOptions()
+    ) async throws {
+        try requireCapability("supportsStepBack", feature: "stepBack")
+        _ = try await sendRunControlCommand(
+            "stepBack",
+            threadID: threadID,
+            additionalArguments: options.asDAPArguments()
+        )
+    }
+
+    public func fetchStepInTargets(frameID: Int) async throws
+        -> [DAPStepInTarget]
+    {
+        try ensureSessionIsRunning()
+        try requireCapability(
+            "supportsStepInTargetsRequest",
+            feature: "stepInTargets"
+        )
+        let response = try await broker.sendRequest(
+            command: "stepInTargets",
+            arguments: .object([
+                "frameId": .number(Double(frameID))
+            ])
+        )
+        try ensureSuccess(response, context: "stepInTargets")
+        guard
+            let targets = response.body?
+                .objectValue?["targets"]?.arrayValue
+        else {
+            throw DAPError.invalidResponse(
+                "stepInTargets response missing 'targets' array"
+            )
+        }
+        return try targets.map { try DAPStepInTarget(json: $0) }
     }
 
     public func fetchThreads() async throws -> [DAPThread] {
@@ -709,6 +777,31 @@ public final class DAPSession: Sendable {
             arguments: arguments
         )
         try ensureSuccess(response, context: "setExceptionBreakpoints")
+    }
+
+    private func updateAdapterCapabilities(
+        _ capabilities: [String: DAPJSONValue]
+    ) {
+        capabilityFlags = capabilities.reduce(into: [:]) { result, entry in
+            if let boolValue = entry.value.boolValue {
+                result[entry.key] = boolValue
+            }
+        }
+    }
+
+    private func supportsCapability(_ capability: String) -> Bool {
+        capabilityFlags[capability] == true
+    }
+
+    private func requireCapability(
+        _ capability: String,
+        feature: String
+    ) throws {
+        guard supportsCapability(capability) else {
+            throw DAPError.unsupportedFeature(
+                "\(feature) requires adapter capability \(capability)"
+            )
+        }
     }
 
     @discardableResult

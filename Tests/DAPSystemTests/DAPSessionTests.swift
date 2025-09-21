@@ -131,7 +131,11 @@ final class DAPSessionTests: XCTestCase {
             session,
             transport: transport,
             expectedCommand: "launch",
-            expectedArguments: configuration
+            expectedArguments: configuration,
+            capabilities: [
+                "supportsStepBack": .bool(true),
+                "supportsStepInTargetsRequest": .bool(true),
+            ]
         )
 
         transport.clearSentMessages()
@@ -169,35 +173,90 @@ final class DAPSessionTests: XCTestCase {
         transport.sendResponse(to: pauseRequest, body: nil)
         _ = try await pauseTask.value
 
-        let stepInTask = Task { try await session.stepIn(threadID: 7) }
+        let stepInTask = Task {
+            try await session.stepIn(
+                threadID: 7,
+                targetID: 3,
+                options: DAPSteppingOptions(
+                    singleThread: true,
+                    granularity: .instruction
+                )
+            )
+        }
         try await waitForRequests(on: transport, count: 3)
         guard case .request(let stepInRequest) = transport.sentMessages[2]
         else {
             return XCTFail("Expected stepIn request")
         }
         XCTAssertEqual(stepInRequest.command, "stepIn")
+        let stepInArguments = stepInRequest.arguments?.objectValue
+        XCTAssertEqual(stepInArguments?["threadId"]?.intValue, 7)
+        XCTAssertEqual(stepInArguments?["targetId"]?.intValue, 3)
+        XCTAssertEqual(stepInArguments?["singleThread"]?.boolValue, true)
+        XCTAssertEqual(
+            stepInArguments?["granularity"]?.stringValue,
+            "instruction"
+        )
         transport.sendResponse(to: stepInRequest, body: nil)
         _ = try await stepInTask.value
 
-        let stepOutTask = Task { try await session.stepOut(threadID: 7) }
+        let stepOutTask = Task {
+            try await session.stepOut(
+                threadID: 7,
+                options: DAPSteppingOptions(granularity: .line)
+            )
+        }
         try await waitForRequests(on: transport, count: 4)
         guard case .request(let stepOutRequest) = transport.sentMessages[3]
         else {
             return XCTFail("Expected stepOut request")
         }
         XCTAssertEqual(stepOutRequest.command, "stepOut")
+        XCTAssertEqual(
+            stepOutRequest.arguments?.objectValue?["granularity"]?.stringValue,
+            "line"
+        )
         transport.sendResponse(to: stepOutRequest, body: nil)
         _ = try await stepOutTask.value
 
-        let stepOverTask = Task { try await session.stepOver(threadID: 7) }
+        let stepOverTask = Task {
+            try await session.stepOver(
+                threadID: 7,
+                options: DAPSteppingOptions(singleThread: true)
+            )
+        }
         try await waitForRequests(on: transport, count: 5)
         guard case .request(let stepOverRequest) = transport.sentMessages[4]
         else {
             return XCTFail("Expected step over request")
         }
         XCTAssertEqual(stepOverRequest.command, "next")
+        XCTAssertEqual(
+            stepOverRequest.arguments?.objectValue?["singleThread"]?.boolValue,
+            true
+        )
         transport.sendResponse(to: stepOverRequest, body: nil)
         _ = try await stepOverTask.value
+
+        let stepBackTask = Task {
+            try await session.stepBack(
+                threadID: 7,
+                options: DAPSteppingOptions(granularity: .statement)
+            )
+        }
+        try await waitForRequests(on: transport, count: 6)
+        guard case .request(let stepBackRequest) = transport.sentMessages[5]
+        else {
+            return XCTFail("Expected stepBack request")
+        }
+        XCTAssertEqual(stepBackRequest.command, "stepBack")
+        XCTAssertEqual(
+            stepBackRequest.arguments?
+                .objectValue?["granularity"]?.stringValue,
+            "statement"
+        )
+        transport.sendResponse(to: stepBackRequest, body: nil)
+        _ = try await stepBackTask.value
     }
 
     func testFetchingRuntimeStateParsesResponses() async throws {
@@ -308,6 +367,134 @@ final class DAPSessionTests: XCTestCase {
         )
         let variableValues = try await variablesTask.value
         XCTAssertEqual(variableValues.first?.value, "42")
+    }
+
+    func testFetchStepInTargetsParsesTargets() async throws {
+        let configuration: [String: DAPJSONValue] = [
+            "program": .string("/tmp/app")
+        ]
+
+        let (session, transport) = makeSession(configuration: configuration)
+        try await startSession(
+            session,
+            transport: transport,
+            expectedCommand: "launch",
+            expectedArguments: configuration,
+            capabilities: ["supportsStepInTargetsRequest": .bool(true)]
+        )
+
+        transport.clearSentMessages()
+
+        let targetsTask = Task {
+            try await session.fetchStepInTargets(frameID: 42)
+        }
+        try await waitForRequests(on: transport, count: 1)
+        guard case .request(let targetsRequest) = transport.sentMessages[0]
+        else {
+            return XCTFail("Expected stepInTargets request")
+        }
+        XCTAssertEqual(targetsRequest.command, "stepInTargets")
+        XCTAssertEqual(
+            targetsRequest.arguments?.objectValue?["frameId"]?.intValue,
+            42
+        )
+
+        let responseTargets: [DAPJSONValue] = [
+            .object([
+                "id": .number(1),
+                "label": .string("entry"),
+                "line": .number(10),
+                "column": .number(2),
+            ]),
+            .object([
+                "id": .number(2),
+                "label": .string("alternate"),
+                "instructionPointerReference": .string("0xFFEE"),
+            ]),
+        ]
+
+        transport.sendResponse(
+            to: targetsRequest,
+            body: .object(["targets": .array(responseTargets)])
+        )
+
+        let targets = try await targetsTask.value
+        XCTAssertEqual(
+            targets,
+            [
+                DAPStepInTarget(
+                    id: 1,
+                    label: "entry",
+                    line: 10,
+                    column: 2
+                ),
+                DAPStepInTarget(
+                    id: 2,
+                    label: "alternate",
+                    instructionPointerReference: "0xFFEE"
+                ),
+            ]
+        )
+    }
+
+    func testStepBackThrowsWhenCapabilityMissing() async throws {
+        let configuration: [String: DAPJSONValue] = [
+            "program": .string("/tmp/app")
+        ]
+
+        let (session, transport) = makeSession(configuration: configuration)
+        try await startSession(
+            session,
+            transport: transport,
+            expectedCommand: "launch",
+            expectedArguments: configuration
+        )
+
+        transport.clearSentMessages()
+
+        do {
+            try await session.stepBack(threadID: 9)
+            XCTFail("Expected stepBack to throw without capability")
+        } catch let error as DAPError {
+            guard case .unsupportedFeature(let message) = error else {
+                return XCTFail("Expected unsupportedFeature error")
+            }
+            XCTAssertTrue(message.contains("supportsStepBack"))
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        XCTAssertTrue(transport.sentMessages.isEmpty)
+    }
+
+    func testFetchStepInTargetsRequiresCapability() async throws {
+        let configuration: [String: DAPJSONValue] = [
+            "program": .string("/tmp/app")
+        ]
+
+        let (session, transport) = makeSession(configuration: configuration)
+        try await startSession(
+            session,
+            transport: transport,
+            expectedCommand: "launch",
+            expectedArguments: configuration
+        )
+
+        transport.clearSentMessages()
+
+        do {
+            _ = try await session.fetchStepInTargets(frameID: 7)
+            XCTFail("Expected fetchStepInTargets to throw without capability")
+        } catch let error as DAPError {
+            guard case .unsupportedFeature(let message) = error else {
+                return XCTFail("Expected unsupportedFeature error")
+            }
+            XCTAssertTrue(message.contains("supportsStepInTargetsRequest"))
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        XCTAssertTrue(transport.sentMessages.isEmpty)
     }
 
     func testRuntimeEventsEmitSessionEvents() async throws {
@@ -693,6 +880,7 @@ final class DAPSessionTests: XCTestCase {
         transport: FakeTransport,
         expectedCommand: String,
         expectedArguments: [String: DAPJSONValue],
+        capabilities: [String: DAPJSONValue] = [:],
         timeout: TimeInterval = 1.0
     ) async throws {
         let startTask = Task { try await session.start() }
@@ -705,7 +893,7 @@ final class DAPSessionTests: XCTestCase {
         XCTAssertEqual(initializeRequest.command, "initialize")
         transport.sendResponse(
             to: initializeRequest,
-            body: .object(["capabilities": .object([:])])
+            body: .object(["capabilities": .object(capabilities)])
         )
 
         transport.sendInitializedEvent()
