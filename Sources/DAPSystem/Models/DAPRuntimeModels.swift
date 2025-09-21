@@ -37,6 +37,22 @@ public struct DAPSource: Sendable, Equatable {
     }
 }
 
+extension DAPSource {
+    func asDAPRequestValue() -> DAPJSONValue {
+        var object: [String: DAPJSONValue] = [:]
+        if let name {
+            object["name"] = .string(name)
+        }
+        if let path {
+            object["path"] = .string(path.path)
+        }
+        if let sourceReference {
+            object["sourceReference"] = .number(Double(sourceReference))
+        }
+        return .object(object)
+    }
+}
+
 public struct DAPThread: Sendable, Equatable {
     public let id: Int
     public let name: String

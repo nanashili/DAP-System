@@ -585,7 +585,10 @@ final class DAPSessionTests: XCTestCase {
             session,
             transport: transport,
             expectedCommand: "launch",
-            expectedArguments: configuration
+            expectedArguments: configuration,
+            capabilities: [
+                "supportsDataBreakpoints": .bool(true)
+            ]
         )
 
         transport.clearSentMessages()
@@ -613,6 +616,9 @@ final class DAPSessionTests: XCTestCase {
             try await session.setDataBreakpoints([dataBreakpoint])
         }
         try await waitForRequests(on: transport, count: 2)
+        guard transport.sentMessages.count > 1 else {
+            return XCTFail("Expected setDataBreakpoints request")
+        }
         guard case .request(let dataRequest) = transport.sentMessages[1] else {
             return XCTFail("Expected setDataBreakpoints request")
         }
@@ -621,12 +627,17 @@ final class DAPSessionTests: XCTestCase {
             to: dataRequest,
             body: .object([
                 "breakpoints": .array([
-                    .object(["verified": .bool(true), "id": .string("watch")])
+                    .object([
+                        "verified": .bool(true),
+                        "id": .number(1),
+                        "message": .string("ok"),
+                    ])
                 ])
             ])
         )
-        let dataBreakpointStatuses = try await dataTask.value
-        XCTAssertEqual(dataBreakpointStatuses.first?.id, "watch")
+        let dataBreakpoints = try await dataTask.value
+        XCTAssertEqual(dataBreakpoints.first?.id, 1)
+        XCTAssertEqual(dataBreakpoints.first?.message, "ok")
 
         let sourcesTask = Task { try await session.fetchLoadedSources() }
         try await waitForRequests(on: transport, count: 3)
@@ -837,6 +848,475 @@ final class DAPSessionTests: XCTestCase {
         )
     }
 
+    // MARK: - Breakpoints
+
+    func testSetBreakpointsReturnsAdapterVerification() async throws {
+        let configuration: [String: DAPJSONValue] = [
+            "program": .string("/tmp/app")
+        ]
+
+        let (session, transport) = makeSession(configuration: configuration)
+        try await startSession(
+            session,
+            transport: transport,
+            expectedCommand: "launch",
+            expectedArguments: configuration
+        )
+
+        transport.clearSentMessages()
+
+        let sourceURL = URL(fileURLWithPath: "/tmp/main.swift")
+        let source = DAPSource(
+            name: "main.swift",
+            path: sourceURL,
+            sourceReference: nil
+        )
+        let breakpoints = [
+            DAPSourceBreakpoint(line: 3, condition: "x > 0")
+        ]
+
+        let task = Task {
+            try await session.setBreakpoints(
+                for: source,
+                breakpoints: breakpoints,
+                sourceModified: true
+            )
+        }
+
+        try await waitForRequests(on: transport, count: 1)
+        guard case .request(let request) = transport.sentMessages.first else {
+            return XCTFail("Expected setBreakpoints request")
+        }
+        XCTAssertEqual(request.command, "setBreakpoints")
+        let arguments = request.arguments?.objectValue
+        XCTAssertEqual(
+            arguments?["source"]?.objectValue?["path"]?.stringValue,
+            sourceURL.path
+        )
+        XCTAssertEqual(arguments?["sourceModified"]?.boolValue, true)
+        XCTAssertEqual(arguments?["breakpoints"]?.arrayValue?.count, 1)
+
+        transport.sendResponse(
+            to: request,
+            body: .object([
+                "breakpoints": .array([
+                    .object([
+                        "verified": .bool(true),
+                        "line": .number(3),
+                        "id": .number(99),
+                    ])
+                ])
+            ])
+        )
+
+        let results = try await task.value
+        XCTAssertEqual(results.first?.id, 99)
+        XCTAssertEqual(results.first?.line, 3)
+        XCTAssertEqual(results.first?.verified, true)
+    }
+
+    func testSetFunctionBreakpointsRequiresCapability() async throws {
+        let configuration: [String: DAPJSONValue] = [
+            "program": .string("/tmp/app")
+        ]
+
+        let (session, transport) = makeSession(configuration: configuration)
+        try await startSession(
+            session,
+            transport: transport,
+            expectedCommand: "launch",
+            expectedArguments: configuration
+        )
+
+        transport.clearSentMessages()
+
+        do {
+            _ = try await session.setFunctionBreakpoints([
+                DAPFunctionBreakpoint(name: "main")
+            ])
+            XCTFail("Expected unsupported feature error")
+        } catch {
+            guard case DAPError.unsupportedFeature = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testSetFunctionBreakpointsParsesResponse() async throws {
+        let configuration: [String: DAPJSONValue] = [
+            "program": .string("/tmp/app")
+        ]
+
+        let (session, transport) = makeSession(configuration: configuration)
+        try await startSession(
+            session,
+            transport: transport,
+            expectedCommand: "launch",
+            expectedArguments: configuration,
+            capabilities: [
+                "supportsFunctionBreakpoints": .bool(true)
+            ]
+        )
+
+        transport.clearSentMessages()
+
+        let task = Task {
+            try await session.setFunctionBreakpoints([
+                DAPFunctionBreakpoint(
+                    name: "main",
+                    hitCondition: "2"
+                )
+            ])
+        }
+
+        try await waitForRequests(on: transport, count: 1)
+        guard case .request(let request) = transport.sentMessages.first else {
+            return XCTFail("Expected setFunctionBreakpoints request")
+        }
+        XCTAssertEqual(request.command, "setFunctionBreakpoints")
+        XCTAssertEqual(
+            request.arguments?.objectValue?["breakpoints"]?
+                .arrayValue?.first?.objectValue?["hitCondition"]?.stringValue,
+            "2"
+        )
+
+        transport.sendResponse(
+            to: request,
+            body: .object([
+                "breakpoints": .array([
+                    .object([
+                        "verified": .bool(true),
+                        "id": .number(7),
+                    ])
+                ])
+            ])
+        )
+
+        let results = try await task.value
+        XCTAssertEqual(results.first?.id, 7)
+    }
+
+    func testSetInstructionBreakpointsParsesResponse() async throws {
+        let configuration: [String: DAPJSONValue] = [
+            "program": .string("/tmp/app")
+        ]
+
+        let (session, transport) = makeSession(configuration: configuration)
+        try await startSession(
+            session,
+            transport: transport,
+            expectedCommand: "launch",
+            expectedArguments: configuration,
+            capabilities: [
+                "supportsInstructionBreakpoints": .bool(true)
+            ]
+        )
+
+        transport.clearSentMessages()
+
+        let task = Task {
+            try await session.setInstructionBreakpoints([
+                DAPInstructionBreakpoint(
+                    instructionReference: "0x1234",
+                    offset: 4
+                )
+            ])
+        }
+
+        try await waitForRequests(on: transport, count: 1)
+        guard case .request(let request) = transport.sentMessages.first else {
+            return XCTFail("Expected setInstructionBreakpoints request")
+        }
+        XCTAssertEqual(request.command, "setInstructionBreakpoints")
+        XCTAssertEqual(
+            request.arguments?.objectValue?["breakpoints"]?
+                .arrayValue?.first?.objectValue?["offset"]?.intValue,
+            4
+        )
+
+        transport.sendResponse(
+            to: request,
+            body: .object([
+                "breakpoints": .array([
+                    .object([
+                        "verified": .bool(true),
+                        "instructionReference": .string("0x1234"),
+                    ])
+                ])
+            ])
+        )
+
+        let results = try await task.value
+        XCTAssertEqual(results.first?.instructionReference, "0x1234")
+    }
+
+    func testSetExceptionBreakpointsWithOptionsRequiresCapabilities()
+        async throws
+    {
+        let configuration: [String: DAPJSONValue] = [
+            "program": .string("/tmp/app")
+        ]
+
+        let (session, transport) = makeSession(configuration: configuration)
+        try await startSession(
+            session,
+            transport: transport,
+            expectedCommand: "launch",
+            expectedArguments: configuration
+        )
+
+        transport.clearSentMessages()
+
+        do {
+            _ = try await session.setExceptionBreakpoints(
+                ["all"],
+                filterOptions: [
+                    DAPExceptionFilterOption(filterId: "all", condition: "x")
+                ]
+            )
+            XCTFail("Expected unsupported feature error")
+        } catch {
+            guard case DAPError.unsupportedFeature = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+
+        transport.clearSentMessages()
+
+        let (capSession, capTransport) = makeSession(
+            configuration: configuration
+        )
+        try await startSession(
+            capSession,
+            transport: capTransport,
+            expectedCommand: "launch",
+            expectedArguments: configuration,
+            capabilities: [
+                "supportsExceptionFilterOptions": .bool(true),
+                "supportsExceptionOptions": .bool(true),
+            ]
+        )
+
+        capTransport.clearSentMessages()
+
+        let task = Task {
+            try await capSession.setExceptionBreakpoints(
+                ["all"],
+                filterOptions: [
+                    DAPExceptionFilterOption(filterId: "all", condition: "x")
+                ],
+                exceptionOptions: [
+                    DAPExceptionOption(
+                        path: [
+                            DAPExceptionPathSegment(names: ["RuntimeErrors"])
+                        ],
+                        breakMode: .always
+                    )
+                ]
+            )
+        }
+
+        try await waitForRequests(on: capTransport, count: 1)
+        guard case .request(let request) = capTransport.sentMessages.first
+        else {
+            return XCTFail("Expected setExceptionBreakpoints request")
+        }
+        XCTAssertEqual(
+            request.arguments?.objectValue?["filterOptions"]?
+                .arrayValue?.first?.objectValue?["condition"]?.stringValue,
+            "x"
+        )
+        XCTAssertEqual(
+            request.arguments?.objectValue?["exceptionOptions"]?
+                .arrayValue?.first?.objectValue?["breakMode"]?.stringValue,
+            "always"
+        )
+
+        capTransport.sendResponse(
+            to: request,
+            body: .object([
+                "breakpoints": .array([
+                    .object([
+                        "verified": .bool(true),
+                        "message": .string("configured"),
+                    ])
+                ])
+            ])
+        )
+
+        let results = try await task.value
+        XCTAssertEqual(results.first?.message, "configured")
+    }
+
+    func testSetExpressionParsesResponse() async throws {
+        let configuration: [String: DAPJSONValue] = [
+            "program": .string("/tmp/app")
+        ]
+
+        let (session, transport) = makeSession(configuration: configuration)
+        try await startSession(
+            session,
+            transport: transport,
+            expectedCommand: "launch",
+            expectedArguments: configuration,
+            capabilities: [
+                "supportsSetExpression": .bool(true)
+            ]
+        )
+
+        transport.clearSentMessages()
+
+        let task = Task {
+            try await session.setExpression(
+                expression: "a",
+                value: "42",
+                frameID: 1,
+                format: DAPValueFormat(hex: true)
+            )
+        }
+
+        try await waitForRequests(on: transport, count: 1)
+        guard case .request(let request) = transport.sentMessages.first else {
+            return XCTFail("Expected setExpression request")
+        }
+        XCTAssertEqual(
+            request.arguments?.objectValue?["format"]?
+                .objectValue?["hex"]?.boolValue,
+            true
+        )
+
+        transport.sendResponse(
+            to: request,
+            body: .object([
+                "value": .string("0x2A"),
+                "type": .string("Int"),
+                "variablesReference": .number(5),
+                "presentationHint": .object(["kind": .string("data")]),
+            ])
+        )
+
+        let result = try await task.value
+        XCTAssertEqual(result.value, "0x2A")
+        XCTAssertEqual(result.type, "Int")
+        XCTAssertEqual(result.variablesReference, 5)
+        XCTAssertEqual(result.presentationHint?.kind, "data")
+    }
+
+    func testSetVariableParsesResponse() async throws {
+        let configuration: [String: DAPJSONValue] = [
+            "program": .string("/tmp/app")
+        ]
+
+        let (session, transport) = makeSession(configuration: configuration)
+        try await startSession(
+            session,
+            transport: transport,
+            expectedCommand: "launch",
+            expectedArguments: configuration,
+            capabilities: [
+                "supportsSetVariable": .bool(true)
+            ]
+        )
+
+        transport.clearSentMessages()
+
+        let task = Task {
+            try await session.setVariable(
+                containerReference: 9,
+                name: "value",
+                value: "24",
+                format: DAPValueFormat(hex: false)
+            )
+        }
+
+        try await waitForRequests(on: transport, count: 1)
+        guard case .request(let request) = transport.sentMessages.first else {
+            return XCTFail("Expected setVariable request")
+        }
+        XCTAssertEqual(
+            request.arguments?.objectValue?["variablesReference"]?.intValue,
+            9
+        )
+
+        transport.sendResponse(
+            to: request,
+            body: .object([
+                "value": .string("24"),
+                "type": .string("Int"),
+                "variablesReference": .number(0),
+            ])
+        )
+
+        let result = try await task.value
+        XCTAssertEqual(result.value, "24")
+        XCTAssertEqual(result.type, "Int")
+        XCTAssertEqual(result.variablesReference, 0)
+    }
+
+    func testBreakpointLocationsParsesResponse() async throws {
+        let configuration: [String: DAPJSONValue] = [
+            "program": .string("/tmp/app")
+        ]
+
+        let (session, transport) = makeSession(configuration: configuration)
+        try await startSession(
+            session,
+            transport: transport,
+            expectedCommand: "launch",
+            expectedArguments: configuration,
+            capabilities: [
+                "supportsBreakpointLocationsRequest": .bool(true)
+            ]
+        )
+
+        transport.clearSentMessages()
+
+        let sourceURL = URL(fileURLWithPath: "/tmp/main.swift")
+        let source = DAPSource(
+            name: "main.swift",
+            path: sourceURL,
+            sourceReference: nil
+        )
+
+        let task = Task {
+            try await session.breakpointLocations(
+                in: source,
+                line: 5,
+                column: 1,
+                endLine: 6,
+                endColumn: 3
+            )
+        }
+
+        try await waitForRequests(on: transport, count: 1)
+        guard case .request(let request) = transport.sentMessages.first else {
+            return XCTFail("Expected breakpointLocations request")
+        }
+        XCTAssertEqual(request.command, "breakpointLocations")
+        XCTAssertEqual(
+            request.arguments?.objectValue?["source"]?
+                .objectValue?["path"]?.stringValue,
+            sourceURL.path
+        )
+
+        transport.sendResponse(
+            to: request,
+            body: .object([
+                "breakpoints": .array([
+                    .object([
+                        "line": .number(5),
+                        "column": .number(1),
+                        "endLine": .number(5),
+                    ])
+                ])
+            ])
+        )
+
+        let locations = try await task.value
+        XCTAssertEqual(locations.first?.line, 5)
+        XCTAssertEqual(locations.first?.column, 1)
+    }
+
     // MARK: - Helpers
 
     private func makeSession(
@@ -938,7 +1418,15 @@ final class DAPSessionTests: XCTestCase {
         }
 
         XCTFail("Timed out waiting for \(count) messages to be sent")
+        throw WaitError.timeout(
+            expected: count,
+            actual: transport.sentMessages.count
+        )
     }
+}
+
+private enum WaitError: Error {
+    case timeout(expected: Int, actual: Int)
 }
 
 private actor HostDelegateStub: DAPSessionHostDelegate {

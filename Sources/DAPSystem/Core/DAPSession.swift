@@ -26,7 +26,7 @@ public final class DAPSession: Sendable {
     /// callers should hop to the desired queue or actor as needed.
     public var onEvent: (@Sendable (DAPSessionEvent) -> Void)?
 
-    private let broker: DAPMessageBroker
+    internal let broker: DAPMessageBroker
     private let hostDelegate: DAPSessionHostDelegate?
     private let logger = DAPLogger(
         subsystem: "com.valkarystudio.debugger",
@@ -35,11 +35,18 @@ public final class DAPSession: Sendable {
 
     private var capabilityFlags: [String: Bool] = [:]
     private var watchExpressions: [DAPWatchExpression] = []
-    private var conditionalBreakpoints: [DAPConditionalBreakpoint] = []
-    private var lastSynchronizedBreakpointFiles: Set<URL> = []
-    private var pendingBreakpointSync: Bool = true
-    private var exceptionBreakpointFilters: [String] = []
-    private var pendingExceptionBreakpointSync: Bool = true
+    
+    // MARK: - Breakpoints
+    internal var conditionalBreakpoints: [DAPConditionalBreakpoint] = []
+    internal var lastSynchronizedBreakpointFiles: Set<URL> = []
+    internal var pendingBreakpointSync: Bool = true
+    internal var exceptionBreakpointFilters: [String] = []
+    internal var exceptionBreakpointFilterOptions: [DAPExceptionFilterOption] =
+        []
+    internal var exceptionBreakpointOptions: [DAPExceptionOption] = []
+    internal var pendingExceptionBreakpointSync: Bool = true
+    
+    
     private var handshakeContinuation: CheckedContinuation<Void, Error>?
 
     public init(
@@ -380,35 +387,6 @@ public final class DAPSession: Sendable {
         return try variables.map { try DAPVariable(json: $0) }
     }
 
-    public func setExceptionBreakpoints(_ filters: [String]) async throws {
-        exceptionBreakpointFilters = filters
-        pendingExceptionBreakpointSync = true
-        try await performSynchronization()
-    }
-
-    @discardableResult
-    public func setDataBreakpoints(_ breakpoints: [DAPDataBreakpoint])
-        async throws -> [DAPDataBreakpointStatus]
-    {
-        try ensureSessionIsRunning()
-        let arguments = DAPJSONValue.object([
-            "breakpoints": .array(breakpoints.map { $0.jsonValue() })
-        ])
-        let response = try await broker.sendRequest(
-            command: "setDataBreakpoints",
-            arguments: arguments
-        )
-        try ensureSuccess(response, context: "setDataBreakpoints")
-        guard
-            let results = response.body?.objectValue?["breakpoints"]?.arrayValue
-        else {
-            throw DAPError.invalidResponse(
-                "setDataBreakpoints response missing 'breakpoints'"
-            )
-        }
-        return try results.map { try DAPDataBreakpointStatus(json: $0) }
-    }
-
     public func fetchLoadedSources() async throws -> [DAPLoadedSource] {
         try ensureSessionIsRunning()
         let response = try await broker.sendRequest(
@@ -670,18 +648,18 @@ public final class DAPSession: Sendable {
         }
     }
 
-    private func emitEvent(_ event: DAPSessionEvent) {
+    internal func emitEvent(_ event: DAPSessionEvent) {
         onEvent?(event)
     }
 
-    private func scheduleSynchronization() {
+    internal func scheduleSynchronization() {
         guard state == .running else { return }
         Task { [weak self] in
             await self?.flushPendingSynchronizations()
         }
     }
 
-    private func flushPendingSynchronizations() async {
+    internal func flushPendingSynchronizations() async {
         do {
             try await performSynchronization()
         } catch {
@@ -691,95 +669,7 @@ public final class DAPSession: Sendable {
         }
     }
 
-    private func performSynchronization() async throws {
-        guard state == .running else { return }
-        if pendingBreakpointSync {
-            pendingBreakpointSync = false
-            do {
-                try await sendBreakpointUpdates()
-            } catch {
-                pendingBreakpointSync = true
-                throw error
-            }
-        }
-
-        if pendingExceptionBreakpointSync {
-            pendingExceptionBreakpointSync = false
-            do {
-                try await sendExceptionBreakpointUpdates()
-            } catch {
-                pendingExceptionBreakpointSync = true
-                throw error
-            }
-        }
-    }
-
-    private func sendBreakpointUpdates() async throws {
-        let grouped = Dictionary(
-            grouping: conditionalBreakpoints,
-            by: { $0.fileURL }
-        )
-        let filesToUpdate = Set(grouped.keys).union(
-            lastSynchronizedBreakpointFiles
-        )
-
-        for file in filesToUpdate {
-            let breakpoints = grouped[file] ?? []
-            let breakpointValues: [DAPJSONValue] = breakpoints.map {
-                breakpoint in
-                var object: [String: DAPJSONValue] = [
-                    "line": .number(Double(breakpoint.line))
-                ]
-                if let condition = breakpoint.condition.isEmpty
-                    ? nil : breakpoint.condition
-                {
-                    object["condition"] = .string(condition)
-                }
-                if let hitCondition = breakpoint.hitCondition {
-                    object["hitCondition"] = .string(hitCondition)
-                }
-                if let logMessage = breakpoint.logMessage {
-                    object["logMessage"] = .string(logMessage)
-                }
-                return .object(object)
-            }
-
-            let sourceObject: [String: DAPJSONValue] = [
-                "name": .string(file.lastPathComponent),
-                "path": .string(file.path),
-            ]
-
-            let arguments = DAPJSONValue.object([
-                "source": .object(sourceObject),
-                "breakpoints": .array(breakpointValues),
-            ])
-
-            let response = try await broker.sendRequest(
-                command: "setBreakpoints",
-                arguments: arguments
-            )
-
-            try ensureSuccess(
-                response,
-                context: "setBreakpoints for \(file.path)"
-            )
-        }
-
-        lastSynchronizedBreakpointFiles = Set(grouped.keys)
-    }
-
-    private func sendExceptionBreakpointUpdates() async throws {
-        let arguments = DAPJSONValue.object([
-            "filters": .array(exceptionBreakpointFilters.map { .string($0) })
-        ])
-        let response = try await broker.sendRequest(
-            command: "setExceptionBreakpoints",
-            arguments: arguments
-        )
-        try ensureSuccess(response, context: "setExceptionBreakpoints")
-    }
-
-    private func updateAdapterCapabilities(
+    internal func updateAdapterCapabilities(
         _ capabilities: [String: DAPJSONValue]
     ) {
         capabilityFlags = capabilities.reduce(into: [:]) { result, entry in
@@ -789,11 +679,11 @@ public final class DAPSession: Sendable {
         }
     }
 
-    private func supportsCapability(_ capability: String) -> Bool {
+    internal func supportsCapability(_ capability: String) -> Bool {
         capabilityFlags[capability] == true
     }
 
-    private func requireCapability(
+    internal func requireCapability(
         _ capability: String,
         feature: String
     ) throws {
@@ -825,7 +715,7 @@ public final class DAPSession: Sendable {
         return response
     }
 
-    private func ensureSuccess(_ response: DAPResponse, context: String) throws
+    internal func ensureSuccess(_ response: DAPResponse, context: String) throws
     {
         guard response.success else {
             throw DAPError.adapterUnavailable(
@@ -834,7 +724,7 @@ public final class DAPSession: Sendable {
         }
     }
 
-    private func ensureSessionIsRunning() throws {
+    internal func ensureSessionIsRunning() throws {
         guard state == .running else {
             throw DAPError.sessionNotActive
         }
