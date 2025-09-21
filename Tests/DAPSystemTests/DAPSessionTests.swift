@@ -537,12 +537,126 @@ final class DAPSessionTests: XCTestCase {
         XCTAssertEqual(writeResult.bytesWritten, 1)
     }
 
+    func testRunInTerminalRequestsAreDelegatedToHost() async throws {
+        let configuration: [String: DAPJSONValue] = [
+            "program": .string("/tmp/app")
+        ]
+
+        let delegate = HostDelegateStub()
+        await delegate.setRunInTerminalResult(
+            DAPRunInTerminalResult(processId: 1234, shellProcessId: 5678)
+        )
+
+        let (session, transport) = makeSession(
+            configuration: configuration,
+            hostDelegate: delegate
+        )
+        try await startSession(
+            session,
+            transport: transport,
+            expectedCommand: "launch",
+            expectedArguments: configuration
+        )
+
+        transport.clearSentMessages()
+
+        let requestArguments: DAPJSONValue = .object([
+            "args": .array([.string("echo"), .string("Hello")]),
+            "cwd": .string("/tmp"),
+            "kind": .string("integrated"),
+            "env": .object(["FOO": .string("BAR")]),
+        ])
+
+        transport.sendHostRequest(
+            command: "runInTerminal",
+            arguments: requestArguments
+        )
+
+        try await waitForRequests(on: transport, count: 1)
+        guard case .response(let response) = transport.sentMessages[0] else {
+            return XCTFail("Expected runInTerminal response")
+        }
+        XCTAssertTrue(response.success)
+        XCTAssertEqual(
+            response.body?.objectValue?["processId"]?.intValue,
+            1234
+        )
+        XCTAssertEqual(
+            response.body?.objectValue?["shellProcessId"]?.intValue,
+            5678
+        )
+
+        let recordedRequests = await delegate.recordedRunInTerminalRequests()
+        XCTAssertEqual(recordedRequests.count, 1)
+        XCTAssertEqual(recordedRequests.first?.cwd, "/tmp")
+        XCTAssertEqual(recordedRequests.first?.args, ["echo", "Hello"])
+        XCTAssertEqual(recordedRequests.first?.env?["FOO"], "BAR")
+    }
+
+    func testStartDebuggingRequestsAreDelegatedToHost() async throws {
+        let configuration: [String: DAPJSONValue] = [
+            "program": .string("/tmp/app")
+        ]
+
+        let delegate = HostDelegateStub()
+        await delegate.setStartDebuggingResult(
+            DAPStartDebuggingResult(
+                body: .object(["accepted": .bool(true)])
+            )
+        )
+
+        let (session, transport) = makeSession(
+            configuration: configuration,
+            hostDelegate: delegate
+        )
+        try await startSession(
+            session,
+            transport: transport,
+            expectedCommand: "launch",
+            expectedArguments: configuration
+        )
+
+        transport.clearSentMessages()
+
+        let startArguments: DAPJSONValue = .object([
+            "request": .string("launch"),
+            "configuration": .object([
+                "name": .string("child"),
+                "program": .string("/tmp/child"),
+            ]),
+        ])
+
+        transport.sendHostRequest(
+            command: "startDebugging",
+            arguments: startArguments
+        )
+
+        try await waitForRequests(on: transport, count: 1)
+        guard case .response(let response) = transport.sentMessages[0] else {
+            return XCTFail("Expected startDebugging response")
+        }
+        XCTAssertTrue(response.success)
+        XCTAssertEqual(
+            response.body?.objectValue?["accepted"]?.boolValue,
+            true
+        )
+
+        let recordedRequests = await delegate.recordedStartDebuggingRequests()
+        XCTAssertEqual(recordedRequests.count, 1)
+        XCTAssertEqual(recordedRequests.first?.request, "launch")
+        XCTAssertEqual(
+            recordedRequests.first?.configuration["program"]?.stringValue,
+            "/tmp/child"
+        )
+    }
+
     // MARK: - Helpers
 
     private func makeSession(
         configuration: [String: DAPJSONValue],
         supportsConditionalBreakpoints: Bool = true,
-        supportsWatchExpressions: Bool = true
+        supportsWatchExpressions: Bool = true,
+        hostDelegate: DAPSessionHostDelegate? = nil
     ) -> (DAPSession, FakeTransport) {
         let transport = FakeTransport()
         let broker = DAPMessageBroker(transport: transport)
@@ -567,7 +681,8 @@ final class DAPSessionTests: XCTestCase {
         let session = DAPSession(
             manifest: manifest,
             configuration: configuration,
-            broker: broker
+            broker: broker,
+            hostDelegate: hostDelegate
         )
 
         return (session, transport)
@@ -638,10 +753,50 @@ final class DAPSessionTests: XCTestCase {
     }
 }
 
+private actor HostDelegateStub: DAPSessionHostDelegate {
+    private var runInTerminalResult = DAPRunInTerminalResult()
+    private var startDebuggingResult = DAPStartDebuggingResult()
+    private var runInTerminalRequests: [DAPRunInTerminalRequest] = []
+    private var startDebuggingRequests: [DAPStartDebuggingRequest] = []
+
+    func setRunInTerminalResult(_ result: DAPRunInTerminalResult) {
+        runInTerminalResult = result
+    }
+
+    func setStartDebuggingResult(_ result: DAPStartDebuggingResult) {
+        startDebuggingResult = result
+    }
+
+    func recordedRunInTerminalRequests() -> [DAPRunInTerminalRequest] {
+        runInTerminalRequests
+    }
+
+    func recordedStartDebuggingRequests() -> [DAPStartDebuggingRequest] {
+        startDebuggingRequests
+    }
+
+    func session(
+        _ session: DAPSession,
+        runInTerminal request: DAPRunInTerminalRequest
+    ) async throws -> DAPRunInTerminalResult {
+        runInTerminalRequests.append(request)
+        return runInTerminalResult
+    }
+
+    func session(
+        _ session: DAPSession,
+        startDebugging request: DAPStartDebuggingRequest
+    ) async throws -> DAPStartDebuggingResult {
+        startDebuggingRequests.append(request)
+        return startDebuggingResult
+    }
+}
+
 private final class FakeTransport: DAPTransport, @unchecked Sendable {
     private(set) var sentMessages: [DAPMessage] = []
     private var receiveHandler: ((Result<DAPMessage, DAPError>) -> Void)?
     private var nextEventSequence: Int = 1_000
+    private var nextRequestSequence: Int = 2_000
 
     func startReceiving(
         _ handler: @escaping @Sendable (Result<DAPMessage, DAPError>) -> Void
@@ -675,6 +830,17 @@ private final class FakeTransport: DAPTransport, @unchecked Sendable {
         let event = DAPEvent(seq: nextEventSequence, event: name, body: body)
         nextEventSequence += 1
         receiveHandler?(.success(.event(event)))
+    }
+
+    func sendHostRequest(command: String, arguments: DAPJSONValue?) {
+        guard let receiveHandler else { return }
+        let request = DAPRequest(
+            seq: nextRequestSequence,
+            command: command,
+            arguments: arguments
+        )
+        nextRequestSequence += 1
+        receiveHandler(.success(.request(request)))
     }
 
     func clearSentMessages() {

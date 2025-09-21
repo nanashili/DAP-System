@@ -27,6 +27,7 @@ public final class DAPSession: Sendable {
     public var onEvent: (@Sendable (DAPSessionEvent) -> Void)?
 
     private let broker: DAPMessageBroker
+    private let hostDelegate: DAPSessionHostDelegate?
     private let logger = DAPLogger(
         subsystem: "com.valkarystudio.debugger",
         category: "DAPSession"
@@ -44,14 +45,17 @@ public final class DAPSession: Sendable {
     public init(
         manifest: DAPAdapterManifest,
         configuration: [String: DAPJSONValue],
-        broker: DAPMessageBroker
+        broker: DAPMessageBroker,
+        hostDelegate: DAPSessionHostDelegate? = nil
     ) {
         self.identifier = UUID()
         self.manifest = manifest
         self.configuration = configuration
         self.broker = broker
+        self.hostDelegate = hostDelegate
 
         registerRuntimeEventHandlers()
+        registerHostRequestHandlers()
     }
 
     public func start() async throws {
@@ -459,6 +463,64 @@ public final class DAPSession: Sendable {
         } else {
             continuation.resume()
         }
+    }
+
+    private func registerHostRequestHandlers() {
+        Task { [weak self] in
+            guard let self else { return }
+
+            await self.broker.registerRequestHandler(for: "runInTerminal") {
+                [weak self] request in
+                guard let self else { throw DAPError.sessionNotActive }
+                return try await self.handleRunInTerminalRequest(request)
+            }
+
+            await self.broker.registerRequestHandler(for: "startDebugging") {
+                [weak self] request in
+                guard let self else { throw DAPError.sessionNotActive }
+                return try await self.handleStartDebuggingRequest(request)
+            }
+        }
+    }
+
+    private func handleRunInTerminalRequest(_ request: DAPRequest)
+        async throws -> DAPResponse
+    {
+        let payload = try DAPRunInTerminalRequest(arguments: request.arguments)
+        guard let delegate = hostDelegate else {
+            throw DAPError.unsupportedFeature(
+                "runInTerminal is not supported without a host delegate"
+            )
+        }
+        let result = try await delegate.session(self, runInTerminal: payload)
+        return DAPResponse(
+            seq: request.seq,
+            requestSeq: request.seq,
+            success: true,
+            command: request.command,
+            message: nil,
+            body: result.body
+        )
+    }
+
+    private func handleStartDebuggingRequest(_ request: DAPRequest)
+        async throws -> DAPResponse
+    {
+        let payload = try DAPStartDebuggingRequest(arguments: request.arguments)
+        guard let delegate = hostDelegate else {
+            throw DAPError.unsupportedFeature(
+                "startDebugging is not supported without a host delegate"
+            )
+        }
+        let result = try await delegate.session(self, startDebugging: payload)
+        return DAPResponse(
+            seq: request.seq,
+            requestSeq: request.seq,
+            success: true,
+            command: request.command,
+            message: nil,
+            body: result.body
+        )
     }
 
     private func registerRuntimeEventHandlers() {
