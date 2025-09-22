@@ -455,69 +455,6 @@ public enum DAPSessionEvent: Sendable, Equatable {
     case output(DAPOutputEvent)
 }
 
-public struct DAPDataBreakpoint: Sendable, Equatable {
-    public let dataId: String
-    public let accessType: String?
-    public let condition: String?
-    public let hitCondition: String?
-
-    public init(
-        dataId: String,
-        accessType: String? = nil,
-        condition: String? = nil,
-        hitCondition: String? = nil
-    ) {
-        self.dataId = dataId
-        self.accessType = accessType
-        self.condition = condition
-        self.hitCondition = hitCondition
-    }
-
-    func jsonValue() -> DAPJSONValue {
-        var object: [String: DAPJSONValue] = [
-            "dataId": .string(dataId)
-        ]
-        if let accessType {
-            object["accessType"] = .string(accessType)
-        }
-        if let condition {
-            object["condition"] = .string(condition)
-        }
-        if let hitCondition {
-            object["hitCondition"] = .string(hitCondition)
-        }
-        return .object(object)
-    }
-}
-
-public struct DAPDataBreakpointStatus: Sendable, Equatable {
-    public let verified: Bool
-    public let message: String?
-    public let id: String?
-
-    public init(verified: Bool, message: String?, id: String?) {
-        self.verified = verified
-        self.message = message
-        self.id = id
-    }
-
-    init(json: DAPJSONValue) throws {
-        guard case .object(let object) = json,
-            let verified = object["verified"]?.boolValue
-        else {
-            throw DAPError.invalidResponse(
-                "Data breakpoint response missing verification state"
-            )
-        }
-
-        self.init(
-            verified: verified,
-            message: object["message"]?.stringValue,
-            id: object["id"]?.stringValue
-        )
-    }
-}
-
 public struct DAPLoadedSource: Sendable, Equatable {
     public let source: DAPSource
 

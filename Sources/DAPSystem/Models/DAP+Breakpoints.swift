@@ -54,6 +54,8 @@ enum _J {
     static let indexedVariables = "indexedVariables"
     static let memoryReference = "memoryReference"
     static let valueLocationReference = "valueLocationReference"
+    static let dataId = "dataId"
+    static let accessType = "accessType"
 }
 
 @inlinable
@@ -84,6 +86,78 @@ func _putIfSomeBool(
     value: Bool?
 ) {
     if let v = value { object[key] = .bool(v) }
+}
+
+// MARK: - Data Brekapoint
+
+/// A data breakpoint watches a memory location or runtime object identity.
+/// `dataId` is adapter-defined (e.g., memory address, object handle).
+@frozen
+public struct DAPDataBreakpoint: Sendable, Equatable {
+    /// Adapter-defined identifier for the watched data location.
+    public let dataId: String
+    /// Optional access filter (e.g., "read", "write", "readWrite"); adapter-defined.
+    public let accessType: String?
+    /// Boolean expression that must evaluate to true to trigger.
+    public let condition: String?
+    /// Hit count condition (e.g., ">= 5"); adapter-defined grammar.
+    public let hitCondition: String?
+
+    @inlinable
+    public init(
+        dataId: String,
+        accessType: String? = nil,
+        condition: String? = nil,
+        hitCondition: String? = nil
+    ) {
+        self.dataId = dataId
+        self.accessType = accessType
+        self.condition = condition
+        self.hitCondition = hitCondition
+    }
+
+    /// Minimal-allocation JSON builder. Emits only non-empty optionals.
+    public func jsonValue() -> DAPJSONValue {
+        var object: [String: DAPJSONValue] = .init(minimumCapacity: 4)
+        object[_J.dataId] = .string(dataId)
+        _putIfNonEmpty(&object, key: _J.accessType, string: accessType)
+        _putIfNonEmpty(&object, key: _J.condition, string: condition)
+        _putIfNonEmpty(&object, key: _J.hitCondition, string: hitCondition)
+        return .object(object)
+    }
+}
+
+/// Adapter-reported verification/status for a data breakpoint after `setDataBreakpoints`.
+@frozen
+public struct DAPDataBreakpointStatus: Sendable, Equatable {
+    /// Whether the adapter accepted the data breakpoint and will stop on it.
+    public let verified: Bool
+    /// Optional diagnostic message describing verification or rejection.
+    public let message: String?
+    /// Adapter-assigned stable identifier for the data breakpoint (if any).
+    public let id: String?
+
+    @inlinable
+    public init(verified: Bool, message: String?, id: String?) {
+        self.verified = verified
+        self.message = message
+        self.id = id
+    }
+
+    /// Tight, fail-fast parser. Avoids Codable for hot path latency.
+    init(json: DAPJSONValue) throws {
+        guard case .object(let o) = json, let v = o[_J.verified]?.boolValue
+        else {
+            throw DAPError.invalidResponse(
+                "Data breakpoint response missing verification state"
+            )
+        }
+        self.init(
+            verified: v,
+            message: o[_J.message]?.stringValue,
+            id: o[_J.id]?.stringValue
+        )
+    }
 }
 
 // MARK: - Source Breakpoints
