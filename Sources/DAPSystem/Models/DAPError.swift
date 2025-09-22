@@ -7,18 +7,47 @@
 
 import Foundation
 
+/// Canonical error type for the Valkary Studio DAP system.
+/// All runtime and adapter errors should be funneled through this enum
+/// for predictable handling and logging.
+@frozen
 public enum DAPError: Error, LocalizedError, Sendable {
-    case invalidMessage(String)
-    case transportFailure(String)
-    case configurationNotFound(String)
-    case configurationInvalid(String)
-    case adapterUnavailable(String)
-    case processLaunchFailed(String)
-    case sessionNotActive
-    case persistenceFailure(String)
-    case unsupportedFeature(String)
-    case invalidResponse(String)
 
+    /// Malformed or incomplete DAP message from an adapter or client.
+    case invalidMessage(String)
+
+    /// Transport channel failure (e.g., pipe/socket closed unexpectedly).
+    case transportFailure(String)
+
+    /// Referenced configuration identifier not found in workspace/project.
+    case configurationNotFound(String)
+
+    /// Configuration exists but is structurally invalid or missing required fields.
+    case configurationInvalid(String)
+
+    /// Debug adapter is not registered, not installed, or cannot be resolved.
+    case adapterUnavailable(String)
+
+    /// Failure to launch the adapter process (e.g., missing binary, spawn error).
+    case processLaunchFailed(String)
+
+    /// Operation requires an active debug session, but none is active.
+    case sessionNotActive
+
+    /// Failure to persist or restore session state (e.g., workspace storage error).
+    case persistenceFailure(String)
+
+    /// Feature requested by the client is not implemented by the adapter.
+    case unsupportedFeature(String)
+
+    /// Response received from adapter is structurally invalid or missing required fields.
+    case invalidResponse(String)
+}
+
+// MARK: - LocalizedError
+
+extension DAPError {
+    /// Developer- and user-facing descriptions.
     public var errorDescription: String? {
         switch self {
         case .invalidMessage(let reason):

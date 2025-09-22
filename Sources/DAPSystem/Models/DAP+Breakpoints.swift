@@ -4,15 +4,108 @@
 //
 //  Created by Tihan-Nico Paxton on 9/21/25.
 //
+//  Design notes:
+//  - All models are @frozen value types with immutable (let) fields for thread-safety and
+//    predictable copies under Sendable.
+//  - JSON emission pre-reserves dictionary capacity and uses static key storage to avoid
+//    repeated string allocations and hashing.
+//  - Inline helpers avoid branches and temporary arrays where possible.
+//  - Parsers fail fast with tight guards, no intermediate Codable layer, to keep latency low.
+//
 
+import Foundation
+
+// MARK: - Internal Perf Helpers
+
+@usableFromInline
+enum _J {
+    // Static keys live once for the process lifetime. No re-allocation.
+    static let line = "line"
+    static let column = "column"
+    static let endLine = "endLine"
+    static let endColumn = "endColumn"
+    static let id = "id"
+    static let verified = "verified"
+    static let message = "message"
+    static let source = "source"
+    static let instructionReference = "instructionReference"
+    static let offset = "offset"
+    static let reason = "reason"
+    static let condition = "condition"
+    static let hitCondition = "hitCondition"
+    static let logMessage = "logMessage"
+    static let mode = "mode"
+    static let name = "name"
+    static let names = "names"
+    static let negate = "negate"
+    static let path = "path"
+    static let breakMode = "breakMode"
+    static let filterId = "filterId"
+    static let hex = "hex"
+    static let kind = "kind"
+    static let attributes = "attributes"
+    static let visibility = "visibility"
+    static let lazy = "lazy"
+    static let value = "value"
+    static let type = "type"
+    static let presentationHint = "presentationHint"
+    static let variablesReference = "variablesReference"
+    static let namedVariables = "namedVariables"
+    static let indexedVariables = "indexedVariables"
+    static let memoryReference = "memoryReference"
+    static let valueLocationReference = "valueLocationReference"
+}
+
+@inlinable
+
+func _putIfNonEmpty(
+    _ object: inout [String: DAPJSONValue],
+    key: String,
+    string: String?
+) {
+    if let s = string, !s.isEmpty { object[key] = .string(s) }
+}
+
+@inlinable
+
+func _putIfSome<T>(
+    _ object: inout [String: DAPJSONValue],
+    key: String,
+    number: T?
+) where T: BinaryInteger {
+    if let n = number { object[key] = .number(Double(n)) }
+}
+
+@inlinable
+
+func _putIfSomeBool(
+    _ object: inout [String: DAPJSONValue],
+    key: String,
+    value: Bool?
+) {
+    if let v = value { object[key] = .bool(v) }
+}
+
+// MARK: - Source Breakpoints
+
+/// A source-code breakpoint in a file/line/column context.
+/// Only non-empty optional fields are serialized to keep payloads small.
+@frozen
 public struct DAPSourceBreakpoint: Sendable, Equatable {
+    /// 1-based line number where the breakpoint is set. Required by DAP.
     public let line: Int
+    /// Optional 1-based column number. Some adapters ignore columns.
     public let column: Int?
+    /// Boolean expression; hitting breakpoint requires this to evaluate to true.
     public let condition: String?
+    /// Hit count condition (e.g., ">= 5", "== 3"). Adapter-specific grammar.
     public let hitCondition: String?
+    /// Logpoint message template (supports `{var}` substitutions per adapter).
     public let logMessage: String?
+    /// Adapter-specific mode (e.g., "debuggerLog", "trace"). Optional.
     public let mode: String?
 
+    @inlinable
     public init(
         line: Int,
         column: Int? = nil,
@@ -29,35 +122,31 @@ public struct DAPSourceBreakpoint: Sendable, Equatable {
         self.mode = mode
     }
 
-    func jsonValue() -> DAPJSONValue {
-        var object: [String: DAPJSONValue] = [
-            "line": .number(Double(line))
-        ]
-        if let column {
-            object["column"] = .number(Double(column))
-        }
-        if let condition, !condition.isEmpty {
-            object["condition"] = .string(condition)
-        }
-        if let hitCondition, !hitCondition.isEmpty {
-            object["hitCondition"] = .string(hitCondition)
-        }
-        if let logMessage, !logMessage.isEmpty {
-            object["logMessage"] = .string(logMessage)
-        }
-        if let mode, !mode.isEmpty {
-            object["mode"] = .string(mode)
-        }
+    /// Minimal-allocation JSON builder.
+    public func jsonValue() -> DAPJSONValue {
+        var object: [String: DAPJSONValue] = .init(minimumCapacity: 6)
+        object[_J.line] = .number(Double(line))
+        _putIfSome(&object, key: _J.column, number: column)
+        _putIfNonEmpty(&object, key: _J.condition, string: condition)
+        _putIfNonEmpty(&object, key: _J.hitCondition, string: hitCondition)
+        _putIfNonEmpty(&object, key: _J.logMessage, string: logMessage)
+        _putIfNonEmpty(&object, key: _J.mode, string: mode)
         return .object(object)
     }
 }
 
+// MARK: - Function Breakpoints
+
+/// A function breakpoint identified by fully-qualified name per adapter semantics.
+@frozen
 public struct DAPFunctionBreakpoint: Sendable, Equatable {
+    /// Function identifier (e.g., "MyModule.Type.method").
     public let name: String
     public let condition: String?
     public let hitCondition: String?
     public let logMessage: String?
 
+    @inlinable
     public init(
         name: String,
         condition: String? = nil,
@@ -70,29 +159,29 @@ public struct DAPFunctionBreakpoint: Sendable, Equatable {
         self.logMessage = logMessage
     }
 
-    func jsonValue() -> DAPJSONValue {
-        var object: [String: DAPJSONValue] = [
-            "name": .string(name)
-        ]
-        if let condition, !condition.isEmpty {
-            object["condition"] = .string(condition)
-        }
-        if let hitCondition, !hitCondition.isEmpty {
-            object["hitCondition"] = .string(hitCondition)
-        }
-        if let logMessage, !logMessage.isEmpty {
-            object["logMessage"] = .string(logMessage)
-        }
+    public func jsonValue() -> DAPJSONValue {
+        var object: [String: DAPJSONValue] = .init(minimumCapacity: 4)
+        object[_J.name] = .string(name)
+        _putIfNonEmpty(&object, key: _J.condition, string: condition)
+        _putIfNonEmpty(&object, key: _J.hitCondition, string: hitCondition)
+        _putIfNonEmpty(&object, key: _J.logMessage, string: logMessage)
         return .object(object)
     }
 }
 
+// MARK: - Instruction Breakpoints
+
+/// An instruction pointer / address breakpoint (for disassembly views).
+@frozen
 public struct DAPInstructionBreakpoint: Sendable, Equatable {
+    /// Adapter-defined address reference (e.g., memory address or symbol).
     public let instructionReference: String
+    /// Optional byte offset relative to `instructionReference`.
     public let offset: Int?
     public let condition: String?
     public let hitCondition: String?
 
+    @inlinable
     public init(
         instructionReference: String,
         offset: Int? = nil,
@@ -104,37 +193,42 @@ public struct DAPInstructionBreakpoint: Sendable, Equatable {
         self.condition = condition
         self.hitCondition = hitCondition
     }
-
-    func jsonValue() -> DAPJSONValue {
-        var object: [String: DAPJSONValue] = [
-            "instructionReference": .string(instructionReference)
-        ]
-        if let offset {
-            object["offset"] = .number(Double(offset))
-        }
-        if let condition, !condition.isEmpty {
-            object["condition"] = .string(condition)
-        }
-        if let hitCondition, !hitCondition.isEmpty {
-            object["hitCondition"] = .string(hitCondition)
-        }
+    public func jsonValue() -> DAPJSONValue {
+        var object: [String: DAPJSONValue] = .init(minimumCapacity: 4)
+        object[_J.instructionReference] = .string(instructionReference)
+        _putIfSome(&object, key: _J.offset, number: offset)
+        _putIfNonEmpty(&object, key: _J.condition, string: condition)
+        _putIfNonEmpty(&object, key: _J.hitCondition, string: hitCondition)
         return .object(object)
     }
 }
 
+// MARK: - Breakpoint (Reported by Adapter)
+
+/// Adapter-reported canonical breakpoint state (e.g., after setBreakpoints).
+@frozen
 public struct DAPBreakpoint: Sendable, Equatable {
+    /// Stable adapter-level ID (if provided).
     public let id: Int?
+    /// Whether the adapter validated the breakpoint and will stop execution on it.
     public let verified: Bool
+    /// Optional message describing verification or rejection.
     public let message: String?
+    /// Source descriptor for the location (may be absent for instruction BPs).
     public let source: DAPSource?
+    /// 1-based start line/column.
     public let line: Int?
     public let column: Int?
+    /// Optional end range for multi-token spans.
     public let endLine: Int?
     public let endColumn: Int?
+    /// Machine-level reference and offset for instruction breakpoints.
     public let instructionReference: String?
     public let offset: Int?
+    /// Optional reason string (adapter-defined) for changes in verification.
     public let reason: String?
 
+    @inlinable
     public init(
         id: Int?,
         verified: Bool,
@@ -162,43 +256,47 @@ public struct DAPBreakpoint: Sendable, Equatable {
     }
 
     init(json: DAPJSONValue) throws {
-        guard case .object(let object) = json,
-            let verified = object["verified"]?.boolValue
+        guard case .object(let o) = json, let ver = o[_J.verified]?.boolValue
         else {
             throw DAPError.invalidResponse(
                 "Breakpoint payload missing required fields"
             )
         }
 
-        let source: DAPSource?
-        if let sourceValue = object["source"] {
-            source = try DAPSource(json: sourceValue)
+        let src: DAPSource?
+        if let v = o[_J.source] {
+            src = try DAPSource(json: v)
         } else {
-            source = nil
+            src = nil
         }
 
         self.init(
-            id: object["id"]?.intValue,
-            verified: verified,
-            message: object["message"]?.stringValue,
-            source: source,
-            line: object["line"]?.intValue,
-            column: object["column"]?.intValue,
-            endLine: object["endLine"]?.intValue,
-            endColumn: object["endColumn"]?.intValue,
-            instructionReference: object["instructionReference"]?.stringValue,
-            offset: object["offset"]?.intValue,
-            reason: object["reason"]?.stringValue
+            id: o[_J.id]?.intValue,
+            verified: ver,
+            message: o[_J.message]?.stringValue,
+            source: src,
+            line: o[_J.line]?.intValue,
+            column: o[_J.column]?.intValue,
+            endLine: o[_J.endLine]?.intValue,
+            endColumn: o[_J.endColumn]?.intValue,
+            instructionReference: o[_J.instructionReference]?.stringValue,
+            offset: o[_J.offset]?.intValue,
+            reason: o[_J.reason]?.stringValue
         )
     }
 }
 
+// MARK: - Breakpoint Location
+
+/// A concrete location where a breakpoint can be set (e.g., from `breakpointLocations`).
+@frozen
 public struct DAPBreakpointLocation: Sendable, Equatable {
     public let line: Int
     public let column: Int?
     public let endLine: Int?
     public let endColumn: Int?
 
+    @inlinable
     public init(
         line: Int,
         column: Int? = nil,
@@ -212,54 +310,58 @@ public struct DAPBreakpointLocation: Sendable, Equatable {
     }
 
     init(json: DAPJSONValue) throws {
-        guard case .object(let object) = json,
-            let line = object["line"]?.intValue
-        else {
+        guard case .object(let o) = json, let line = o[_J.line]?.intValue else {
             throw DAPError.invalidResponse(
                 "BreakpointLocation payload missing line"
             )
         }
-
         self.init(
             line: line,
-            column: object["column"]?.intValue,
-            endLine: object["endLine"]?.intValue,
-            endColumn: object["endColumn"]?.intValue
+            column: o[_J.column]?.intValue,
+            endLine: o[_J.endLine]?.intValue,
+            endColumn: o[_J.endColumn]?.intValue
         )
     }
 }
 
+// MARK: - Exception Options
+
+/// DAP-defined exception break modes.
 public enum DAPExceptionBreakMode: String, Sendable {
-    case never
-    case always
-    case unhandled
-    case userUnhandled
+    case never, always, unhandled, userUnhandled
 }
 
+/// A segment of an exception type path (hierarchical exception identifiers).
+@frozen
 public struct DAPExceptionPathSegment: Sendable, Equatable {
+    /// Ordered names forming a path component; semantics are adapter-defined.
     public let names: [String]
+    /// If true, treat this path as a negative match.
     public let negate: Bool?
 
+    @inlinable
     public init(names: [String], negate: Bool? = nil) {
         self.names = names
         self.negate = negate
     }
 
-    func jsonValue() -> DAPJSONValue {
-        var object: [String: DAPJSONValue] = [
-            "names": .array(names.map { .string($0) })
-        ]
-        if let negate {
-            object["negate"] = .bool(negate)
-        }
+    public func jsonValue() -> DAPJSONValue {
+        var object: [String: DAPJSONValue] = .init(minimumCapacity: 2)
+        object[_J.names] = .array(names.map(DAPJSONValue.string))
+        _putIfSomeBool(&object, key: _J.negate, value: negate)
         return .object(object)
     }
 }
 
+/// Exception break configuration entry.
+@frozen
 public struct DAPExceptionOption: Sendable, Equatable {
+    /// Hierarchical match path (optional).
     public let path: [DAPExceptionPathSegment]?
+    /// Break behavior.
     public let breakMode: DAPExceptionBreakMode
 
+    @inlinable
     public init(
         path: [DAPExceptionPathSegment]? = nil,
         breakMode: DAPExceptionBreakMode
@@ -268,68 +370,66 @@ public struct DAPExceptionOption: Sendable, Equatable {
         self.breakMode = breakMode
     }
 
-    func jsonValue() -> DAPJSONValue {
-        var object: [String: DAPJSONValue] = [
-            "breakMode": .string(breakMode.rawValue)
-        ]
+    public func jsonValue() -> DAPJSONValue {
+        var object: [String: DAPJSONValue] = .init(minimumCapacity: 2)
+        object[_J.breakMode] = .string(breakMode.rawValue)
         if let path, !path.isEmpty {
-            object["path"] = .array(path.map { $0.jsonValue() })
+            object[_J.path] = .array(path.map { $0.jsonValue() })
         }
         return .object(object)
     }
 }
 
+/// Filter toggles for exception categories defined by the adapter.
+@frozen
 public struct DAPExceptionFilterOption: Sendable, Equatable {
     public let filterId: String
     public let condition: String?
     public let mode: String?
 
-    public init(
-        filterId: String,
-        condition: String? = nil,
-        mode: String? = nil
-    ) {
+    @inlinable
+    public init(filterId: String, condition: String? = nil, mode: String? = nil)
+    {
         self.filterId = filterId
         self.condition = condition
         self.mode = mode
     }
 
-    func jsonValue() -> DAPJSONValue {
-        var object: [String: DAPJSONValue] = [
-            "filterId": .string(filterId)
-        ]
-        if let condition, !condition.isEmpty {
-            object["condition"] = .string(condition)
-        }
-        if let mode, !mode.isEmpty {
-            object["mode"] = .string(mode)
-        }
+    public func jsonValue() -> DAPJSONValue {
+        var object: [String: DAPJSONValue] = .init(minimumCapacity: 3)
+        object[_J.filterId] = .string(filterId)
+        _putIfNonEmpty(&object, key: _J.condition, string: condition)
+        _putIfNonEmpty(&object, key: _J.mode, string: mode)
         return .object(object)
     }
 }
 
+// MARK: - Value/Variable Formatting
+
+/// Optional formatting hints for numeric rendering (e.g., hex).
+@frozen
 public struct DAPValueFormat: Sendable, Equatable {
     public let hex: Bool?
 
-    public init(hex: Bool? = nil) {
-        self.hex = hex
-    }
+    @inlinable
+    public init(hex: Bool? = nil) { self.hex = hex }
 
-    func jsonValue() -> DAPJSONValue {
-        var object: [String: DAPJSONValue] = [:]
-        if let hex {
-            object["hex"] = .bool(hex)
-        }
+    public func jsonValue() -> DAPJSONValue {
+        var object: [String: DAPJSONValue] = .init(minimumCapacity: 1)
+        _putIfSomeBool(&object, key: _J.hex, value: hex)
         return .object(object)
     }
 }
 
+/// UI hint for variables in the tree (kind/visibility/attributes).
+@frozen
 public struct DAPVariablePresentationHint: Sendable, Equatable {
     public let kind: String?
     public let attributes: [String]?
     public let visibility: String?
     public let isLazy: Bool?
 
+    @inlinable
     public init(
         kind: String? = nil,
         attributes: [String]? = nil,
@@ -343,25 +443,25 @@ public struct DAPVariablePresentationHint: Sendable, Equatable {
     }
 
     init(json: DAPJSONValue) throws {
-        guard case .object(let object) = json else {
+        guard case .object(let o) = json else {
             throw DAPError.invalidResponse(
                 "VariablePresentationHint must be an object"
             )
         }
-
-        let attributes = object["attributes"]?.arrayValue?.compactMap {
-            $0.stringValue
-        }
-
+        let attrs = o[_J.attributes]?.arrayValue?.compactMap { $0.stringValue }
         self.init(
-            kind: object["kind"]?.stringValue,
-            attributes: attributes,
-            visibility: object["visibility"]?.stringValue,
-            isLazy: object["lazy"]?.boolValue
+            kind: o[_J.kind]?.stringValue,
+            attributes: attrs,
+            visibility: o[_J.visibility]?.stringValue,
+            isLazy: o[_J.lazy]?.boolValue
         )
     }
 }
 
+// MARK: - Set Expression / Variable Results
+
+/// Result of `setExpression` including presentation and child refs.
+@frozen
 public struct DAPSetExpressionResult: Sendable, Equatable {
     public let value: String
     public let type: String?
@@ -372,6 +472,7 @@ public struct DAPSetExpressionResult: Sendable, Equatable {
     public let memoryReference: String?
     public let valueLocationReference: Int?
 
+    @inlinable
     public init(
         value: String,
         type: String?,
@@ -393,34 +494,33 @@ public struct DAPSetExpressionResult: Sendable, Equatable {
     }
 
     init(json: DAPJSONValue) throws {
-        guard case .object(let object) = json,
-            let value = object["value"]?.stringValue
+        guard case .object(let o) = json, let val = o[_J.value]?.stringValue
         else {
             throw DAPError.invalidResponse(
                 "setExpression response missing 'value'"
             )
         }
-
-        let presentationHint: DAPVariablePresentationHint?
-        if let hintValue = object["presentationHint"] {
-            presentationHint = try DAPVariablePresentationHint(json: hintValue)
-        } else {
-            presentationHint = nil
-        }
-
+        let hint: DAPVariablePresentationHint? = {
+            if let hv = o[_J.presentationHint] {
+                return try? DAPVariablePresentationHint(json: hv)
+            }
+            return nil
+        }()
         self.init(
-            value: value,
-            type: object["type"]?.stringValue,
-            presentationHint: presentationHint,
-            variablesReference: object["variablesReference"]?.intValue,
-            namedVariables: object["namedVariables"]?.intValue,
-            indexedVariables: object["indexedVariables"]?.intValue,
-            memoryReference: object["memoryReference"]?.stringValue,
-            valueLocationReference: object["valueLocationReference"]?.intValue
+            value: val,
+            type: o[_J.type]?.stringValue,
+            presentationHint: hint,
+            variablesReference: o[_J.variablesReference]?.intValue,
+            namedVariables: o[_J.namedVariables]?.intValue,
+            indexedVariables: o[_J.indexedVariables]?.intValue,
+            memoryReference: o[_J.memoryReference]?.stringValue,
+            valueLocationReference: o[_J.valueLocationReference]?.intValue
         )
     }
 }
 
+/// Result of `setVariable` (subset of setExpression result).
+@frozen
 public struct DAPSetVariableResult: Sendable, Equatable {
     public let value: String
     public let type: String?
@@ -430,6 +530,7 @@ public struct DAPSetVariableResult: Sendable, Equatable {
     public let memoryReference: String?
     public let valueLocationReference: Int?
 
+    @inlinable
     public init(
         value: String,
         type: String?,
@@ -449,22 +550,20 @@ public struct DAPSetVariableResult: Sendable, Equatable {
     }
 
     init(json: DAPJSONValue) throws {
-        guard case .object(let object) = json,
-            let value = object["value"]?.stringValue
+        guard case .object(let o) = json, let val = o[_J.value]?.stringValue
         else {
             throw DAPError.invalidResponse(
                 "setVariable response missing 'value'"
             )
         }
-
         self.init(
-            value: value,
-            type: object["type"]?.stringValue,
-            variablesReference: object["variablesReference"]?.intValue,
-            namedVariables: object["namedVariables"]?.intValue,
-            indexedVariables: object["indexedVariables"]?.intValue,
-            memoryReference: object["memoryReference"]?.stringValue,
-            valueLocationReference: object["valueLocationReference"]?.intValue
+            value: val,
+            type: o[_J.type]?.stringValue,
+            variablesReference: o[_J.variablesReference]?.intValue,
+            namedVariables: o[_J.namedVariables]?.intValue,
+            indexedVariables: o[_J.indexedVariables]?.intValue,
+            memoryReference: o[_J.memoryReference]?.stringValue,
+            valueLocationReference: o[_J.valueLocationReference]?.intValue
         )
     }
 }
